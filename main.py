@@ -151,20 +151,6 @@ async def health_check():
 
 @app.post("/extract-audio", response_model=AudioResponse)
 async def extract_audio(youtube_url: YouTubeURL):
-<<<<<<< HEAD
-=======
-    """
-    Extract audio from YouTube video with cookie support
-    
-    Args:
-        url: YouTube video URL
-        format: Output audio format (wav, mp3, flac)
-        sample_rate: Target sample rate (default: 16000 for whisper)
-        use_cookies: Whether to use browser cookies (default: True)
-        cookies_browser: Browser to extract cookies from (chrome, firefox, edge, etc.)
-        cookies_file: Path to cookies.txt file (alternative to browser cookies)
-    """
->>>>>>> d70262ce1762ae101c9bf699b2bed50e8c9e4abd
     try:
         video_url = str(youtube_url.url)
         file_id = str(uuid.uuid4())
@@ -175,21 +161,12 @@ async def extract_audio(youtube_url: YouTubeURL):
         ydl_opts = get_ydl_opts(
             format=youtube_url.format,
             output_template=temp_output,
-<<<<<<< HEAD
             use_cookies=youtube_url.use_cookies
         )
         
         logger.info(f"Downloading audio from: {video_url}")
         if youtube_url.use_cookies and cookies_available:
             logger.info("Using cookies for authentication")
-=======
-            use_cookies=getattr(youtube_url, 'use_cookies', True),
-            cookies_browser=getattr(youtube_url, 'cookies_browser', 'chrome'),
-            cookies_file=getattr(youtube_url, 'cookies_file', None)
-        )
-        
-        logger.info(f"Downloading audio from: {video_url} with cookies")
->>>>>>> d70262ce1762ae101c9bf699b2bed50e8c9e4abd
         
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(video_url, download=True)
@@ -244,10 +221,8 @@ async def extract_audio(youtube_url: YouTubeURL):
     except Exception as e:
         logger.error(f"Unexpected error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
-        
 
 # ... (keep the download-audio and cleanup endpoints the same)
-
 
 @app.get("/download-audio/{file_id}")
 async def download_audio(file_id: str):
