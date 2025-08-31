@@ -125,15 +125,15 @@ async def health_check():
 @app.post("/extract-audio", response_model=AudioResponse)
 async def extract_audio(youtube_url: YouTubeURL):
     """
-    Extract audio from YouTube video and prepare for faster-whisper
+    Extract audio from YouTube video with cookie support
     
     Args:
         url: YouTube video URL
         format: Output audio format (wav, mp3, flac)
         sample_rate: Target sample rate (default: 16000 for whisper)
-    
-    Returns:
-        AudioResponse with path to processed audio file
+        use_cookies: Whether to use browser cookies (default: True)
+        cookies_browser: Browser to extract cookies from (chrome, firefox, edge, etc.)
+        cookies_file: Path to cookies.txt file (alternative to browser cookies)
     """
     try:
         video_url = str(youtube_url.url)
@@ -141,10 +141,16 @@ async def extract_audio(youtube_url: YouTubeURL):
         temp_output = os.path.join(temp_dir, f"original_{file_id}")
         final_output = os.path.join(temp_dir, f"whisper_ready_{file_id}.wav")
         
-        # Download audio using yt-dlp
-        ydl_opts = get_ydl_opts(youtube_url.format, temp_output)
+        # Download audio using yt-dlp with cookies
+        ydl_opts = get_ydl_opts(
+            format=youtube_url.format,
+            output_template=temp_output,
+            use_cookies=getattr(youtube_url, 'use_cookies', True),
+            cookies_browser=getattr(youtube_url, 'cookies_browser', 'chrome'),
+            cookies_file=getattr(youtube_url, 'cookies_file', None)
+        )
         
-        logger.info(f"Downloading audio from: {video_url}")
+        logger.info(f"Downloading audio from: {video_url} with cookies")
         
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(video_url, download=True)
@@ -180,7 +186,7 @@ async def extract_audio(youtube_url: YouTubeURL):
             except:
                 pass
             
-            # Cache the file path (in production, you might want to use Redis or database)
+            # Cache the file path
             cached_audio_files[file_id] = {
                 'path': final_output,
                 'created_at': asyncio.get_event_loop().time()
@@ -188,7 +194,7 @@ async def extract_audio(youtube_url: YouTubeURL):
             
             return AudioResponse(
                 success=True,
-                audio_path=file_id,  # Return ID instead of full path for security
+                audio_path=file_id,
                 duration=duration,
                 file_size=file_size
             )
@@ -199,6 +205,7 @@ async def extract_audio(youtube_url: YouTubeURL):
     except Exception as e:
         logger.error(f"Unexpected error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        
 
 @app.get("/download-audio/{file_id}")
 async def download_audio(file_id: str):
