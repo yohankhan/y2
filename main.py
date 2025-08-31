@@ -73,8 +73,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Update your get_ydl_opts function in main.py
 def get_ydl_opts(format: str, output_template: str, use_cookies: bool = True):
-    """Get yt-dlp options with cookie support"""
+    """Get yt-dlp options with better anti-blocking settings"""
     opts = {
         'format': 'bestaudio/best',
         'postprocessors': [{
@@ -83,16 +84,30 @@ def get_ydl_opts(format: str, output_template: str, use_cookies: bool = True):
             'preferredquality': '192',
         }],
         'outtmpl': output_template,
-        'quiet': True,
-        'no_warnings': True,
-        'ignoreerrors': True,
+        'quiet': False,  # Set to False to see more logs
+        'no_warnings': False,
+        'ignoreerrors': False,
         'no_check_certificate': True,
+        'geo_bypass': True,
+        'geo_bypass_country': 'US',
         'http_headers': {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'none',
+            'Sec-Fetch-User': '?1',
         },
-        'socket_timeout': 30,
-        'retries': 3,
+        'socket_timeout': 60,
+        'retries': 10,
+        'fragment_retries': 10,
+        'extractor_retries': 3,
+        'skip_unavailable_fragments': True,
+        'keep_fragments': True,
     }
     
     # Add cookies support if available and requested
@@ -104,6 +119,7 @@ def get_ydl_opts(format: str, output_template: str, use_cookies: bool = True):
     
     return opts
 
+    
 def check_ffmpeg():
     try:
         subprocess.run(['ffmpeg', '-version'], capture_output=True, check=True)
