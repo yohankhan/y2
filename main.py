@@ -1,0 +1,252 @@
+import os
+import tempfile
+import logging
+from typing import Optional
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import JSONResponse, FileResponse
+from fastapi.middleware.cors import CORSMiddleware
+import yt_dlp
+import ffmpeg
+import aiofiles
+import asyncio
+from pydantic import BaseModel, HttpUrl
+import uuid
+from contextlib import asynccontextmanager
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class YouTubeURL(BaseModel):
+    url: HttpUrl
+    format: Optional[str] = "wav"
+    sample_rate: Optional[int] = 16000
+
+class AudioResponse(BaseModel):
+    success: bool
+    audio_path: Optional[str] = None
+    error: Optional[str] = None
+    duration: Optional[float] = None
+    file_size: Optional[int] = None
+
+# Global variables for caching
+cached_audio_files = {}
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup: Create temp directory
+    global temp_dir
+    temp_dir = tempfile.mkdtemp()
+    logger.info(f"Created temporary directory: {temp_dir}")
+    
+    yield
+    
+    # Shutdown: Cleanup
+    import shutil
+    shutil.rmtree(temp_dir, ignore_errors=True)
+    logger.info("Cleaned up temporary directory")
+
+app = FastAPI(
+    title="YouTube to Whisper API",
+    description="API to extract audio from YouTube videos for faster-whisper processing",
+    version="1.0.0",
+    lifespan=lifespan
+)
+
+# CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+def get_ydl_opts(format: str, output_template: str):
+    """Get yt-dlp options with proper headers to avoid blocking"""
+    return {
+        'format': 'bestaudio/best',
+        'postprocessors': [{
+            'key': 'FFmpegExtractAudio',
+            'preferredcodec': format,
+            'preferredquality': '192',
+        }],
+        'outtmpl': output_template,
+        'quiet': True,
+        'no_warnings': True,
+        'ignoreerrors': True,
+        'no_check_certificate': True,
+        'geo_bypass': True,
+        'geo_bypass_country': 'US',
+        'http_headers': {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'en-us,en;q=0.5',
+            'Accept-Encoding': 'gzip,deflate',
+            'Accept-Charset': 'ISO-8859-1,utf-8;q=0.7,*;q=0.7',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+        },
+        'extract_flat': False,
+        'force-ipv4': True,
+        'socket_timeout': 30,
+        'retries': 3,
+    }
+
+async def convert_to_whisper_format(input_path: str, output_path: str, sample_rate: int = 16000):
+    """Convert audio to format compatible with faster-whisper"""
+    try:
+        (
+            ffmpeg
+            .input(input_path)
+            .output(
+                output_path,
+                acodec='pcm_s16le',
+                ac=1,
+                ar=sample_rate,
+                loglevel='error'
+            )
+            .overwrite_output()
+            .run(capture_stdout=True, capture_stderr=True)
+        )
+        return True
+    except ffmpeg.Error as e:
+        logger.error(f"FFmpeg error: {e.stderr.decode() if e.stderr else str(e)}")
+        return False
+
+@app.get("/")
+async def root():
+    return {"message": "YouTube to Whisper API", "status": "healthy"}
+
+@app.get("/health")
+async def health_check():
+    return {"status": "healthy", "service": "youtube-whisper-api"}
+
+@app.post("/extract-audio", response_model=AudioResponse)
+async def extract_audio(youtube_url: YouTubeURL):
+    """
+    Extract audio from YouTube video and prepare for faster-whisper
+    
+    Args:
+        url: YouTube video URL
+        format: Output audio format (wav, mp3, flac)
+        sample_rate: Target sample rate (default: 16000 for whisper)
+    
+    Returns:
+        AudioResponse with path to processed audio file
+    """
+    try:
+        video_url = str(youtube_url.url)
+        file_id = str(uuid.uuid4())
+        temp_output = os.path.join(temp_dir, f"original_{file_id}")
+        final_output = os.path.join(temp_dir, f"whisper_ready_{file_id}.wav")
+        
+        # Download audio using yt-dlp
+        ydl_opts = get_ydl_opts(youtube_url.format, temp_output)
+        
+        logger.info(f"Downloading audio from: {video_url}")
+        
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(video_url, download=True)
+            
+            if not info:
+                raise HTTPException(status_code=400, detail="Failed to extract video info")
+            
+            # Find the downloaded file
+            downloaded_files = [f for f in os.listdir(temp_dir) if f.startswith(f"original_{file_id}")]
+            if not downloaded_files:
+                raise HTTPException(status_code=500, detail="Audio file not found after download")
+            
+            original_file = os.path.join(temp_dir, downloaded_files[0])
+            
+            # Convert to whisper-compatible format
+            logger.info("Converting audio to whisper format...")
+            success = await convert_to_whisper_format(
+                original_file, 
+                final_output, 
+                youtube_url.sample_rate
+            )
+            
+            if not success:
+                raise HTTPException(status_code=500, detail="Audio conversion failed")
+            
+            # Get file info
+            file_size = os.path.getsize(final_output)
+            duration = info.get('duration', 0)
+            
+            # Clean up original file
+            try:
+                os.remove(original_file)
+            except:
+                pass
+            
+            # Cache the file path (in production, you might want to use Redis or database)
+            cached_audio_files[file_id] = {
+                'path': final_output,
+                'created_at': asyncio.get_event_loop().time()
+            }
+            
+            return AudioResponse(
+                success=True,
+                audio_path=file_id,  # Return ID instead of full path for security
+                duration=duration,
+                file_size=file_size
+            )
+            
+    except yt_dlp.utils.DownloadError as e:
+        logger.error(f"Download error: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Download failed: {str(e)}")
+    except Exception as e:
+        logger.error(f"Unexpected error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+@app.get("/download-audio/{file_id}")
+async def download_audio(file_id: str):
+    """Download the processed audio file"""
+    if file_id not in cached_audio_files:
+        raise HTTPException(status_code=404, detail="File not found")
+    
+    file_path = cached_audio_files[file_id]['path']
+    
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="File no longer exists")
+    
+    return FileResponse(
+        file_path,
+        media_type="audio/wav",
+        filename=f"audio_{file_id}.wav"
+    )
+
+@app.delete("/cleanup/{file_id}")
+async def cleanup_audio(file_id: str):
+    """Clean up audio file after processing"""
+    if file_id in cached_audio_files:
+        file_path = cached_audio_files[file_id]['path']
+        try:
+            os.remove(file_path)
+            del cached_audio_files[file_id]
+            return {"success": True, "message": "File cleaned up"}
+        except:
+            return {"success": False, "message": "Cleanup failed"}
+    return {"success": False, "message": "File not found"}
+
+# Error handlers
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request, exc):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"success": False, "error": exc.detail}
+    )
+
+@app.exception_handler(Exception)
+async def general_exception_handler(request, exc):
+    logger.error(f"Unhandled exception: {exc}")
+    return JSONResponse(
+        status_code=500,
+        content={"success": False, "error": "Internal server error"}
+    )
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
