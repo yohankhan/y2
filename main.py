@@ -2,16 +2,17 @@ import os
 import tempfile
 import logging
 from typing import Optional
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 import yt_dlp
-import ffmpeg
 import aiofiles
 import asyncio
 from pydantic import BaseModel, HttpUrl
 import uuid
 from contextlib import asynccontextmanager
+import subprocess
+import shutil
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -21,6 +22,7 @@ class YouTubeURL(BaseModel):
     url: HttpUrl
     format: Optional[str] = "wav"
     sample_rate: Optional[int] = 16000
+    use_cookies: Optional[bool] = True
 
 class AudioResponse(BaseModel):
     success: bool
@@ -29,22 +31,31 @@ class AudioResponse(BaseModel):
     duration: Optional[float] = None
     file_size: Optional[int] = None
 
-# Global variables for caching
+# Global variables
 cached_audio_files = {}
+temp_dir = None
+COOKIES_FILE = "cookies.txt"
+cookies_available = os.path.exists(COOKIES_FILE)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup: Create temp directory
     global temp_dir
     temp_dir = tempfile.mkdtemp()
     logger.info(f"Created temporary directory: {temp_dir}")
     
+    if cookies_available:
+        logger.info(f"Cookies file found: {COOKIES_FILE}")
+    else:
+        logger.warning("No cookies.txt file found. Some videos may require authentication.")
+    
     yield
     
     # Shutdown: Cleanup
-    import shutil
-    shutil.rmtree(temp_dir, ignore_errors=True)
-    logger.info("Cleaned up temporary directory")
+    try:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        logger.info("Cleaned up temporary directory")
+    except:
+        pass
 
 app = FastAPI(
     title="YouTube to Whisper API",
@@ -62,9 +73,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-def get_ydl_opts(format: str, output_template: str):
-    """Get yt-dlp options with proper headers to avoid blocking"""
-    return {
+def get_ydl_opts(format: str, output_template: str, use_cookies: bool = True):
+    """Get yt-dlp options with cookie support"""
+    opts = {
         'format': 'bestaudio/best',
         'postprocessors': [{
             'key': 'FFmpegExtractAudio',
@@ -76,75 +87,86 @@ def get_ydl_opts(format: str, output_template: str):
         'no_warnings': True,
         'ignoreerrors': True,
         'no_check_certificate': True,
-        'geo_bypass': True,
-        'geo_bypass_country': 'US',
         'http_headers': {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            'Accept-Language': 'en-us,en;q=0.5',
-            'Accept-Encoding': 'gzip,deflate',
-            'Accept-Charset': 'ISO-8859-1,utf-8;q=0.7,*;q=0.7',
-            'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1',
         },
-        'extract_flat': False,
-        'force-ipv4': True,
         'socket_timeout': 30,
         'retries': 3,
     }
+    
+    # Add cookies support if available and requested
+    if use_cookies and cookies_available:
+        opts['cookiefile'] = COOKIES_FILE
+        logger.info("Using cookies from cookies.txt file")
+    elif use_cookies and not cookies_available:
+        logger.warning("Cookies requested but cookies.txt not found")
+    
+    return opts
+
+def check_ffmpeg():
+    try:
+        subprocess.run(['ffmpeg', '-version'], capture_output=True, check=True)
+        return True
+    except (subprocess.SubprocessError, FileNotFoundError):
+        return False
 
 async def convert_to_whisper_format(input_path: str, output_path: str, sample_rate: int = 16000):
     """Convert audio to format compatible with faster-whisper"""
     try:
-        (
-            ffmpeg
-            .input(input_path)
-            .output(
-                output_path,
-                acodec='pcm_s16le',
-                ac=1,
-                ar=sample_rate,
-                loglevel='error'
-            )
-            .overwrite_output()
-            .run(capture_stdout=True, capture_stderr=True)
-        )
+        # Use subprocess instead of ffmpeg-python for better compatibility
+        cmd = [
+            'ffmpeg', '-i', input_path,
+            '-acodec', 'pcm_s16le',
+            '-ac', '1',
+            '-ar', str(sample_rate),
+            '-y',  # Overwrite output file
+            output_path
+        ]
+        
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        if result.returncode != 0:
+            logger.error(f"FFmpeg failed: {result.stderr}")
+            return False
         return True
-    except ffmpeg.Error as e:
-        logger.error(f"FFmpeg error: {e.stderr.decode() if e.stderr else str(e)}")
+    except Exception as e:
+        logger.error(f"Audio conversion error: {e}")
         return False
 
 @app.get("/")
 async def root():
-    return {"message": "YouTube to Whisper API", "status": "healthy"}
+    return {
+        "message": "YouTube to Whisper API", 
+        "status": "healthy", 
+        "cookies_available": cookies_available
+    }
 
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy", "service": "youtube-whisper-api"}
+    return {
+        "status": "healthy", 
+        "service": "youtube-whisper-api",
+        "cookies_available": cookies_available
+    }
 
 @app.post("/extract-audio", response_model=AudioResponse)
 async def extract_audio(youtube_url: YouTubeURL):
-    """
-    Extract audio from YouTube video and prepare for faster-whisper
-    
-    Args:
-        url: YouTube video URL
-        format: Output audio format (wav, mp3, flac)
-        sample_rate: Target sample rate (default: 16000 for whisper)
-    
-    Returns:
-        AudioResponse with path to processed audio file
-    """
     try:
         video_url = str(youtube_url.url)
         file_id = str(uuid.uuid4())
         temp_output = os.path.join(temp_dir, f"original_{file_id}")
         final_output = os.path.join(temp_dir, f"whisper_ready_{file_id}.wav")
         
-        # Download audio using yt-dlp
-        ydl_opts = get_ydl_opts(youtube_url.format, temp_output)
+        # Download audio using yt-dlp with cookies
+        ydl_opts = get_ydl_opts(
+            format=youtube_url.format,
+            output_template=temp_output,
+            use_cookies=youtube_url.use_cookies
+        )
         
         logger.info(f"Downloading audio from: {video_url}")
+        if youtube_url.use_cookies and cookies_available:
+            logger.info("Using cookies for authentication")
         
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(video_url, download=True)
@@ -180,7 +202,7 @@ async def extract_audio(youtube_url: YouTubeURL):
             except:
                 pass
             
-            # Cache the file path (in production, you might want to use Redis or database)
+            # Cache the file path
             cached_audio_files[file_id] = {
                 'path': final_output,
                 'created_at': asyncio.get_event_loop().time()
@@ -188,7 +210,7 @@ async def extract_audio(youtube_url: YouTubeURL):
             
             return AudioResponse(
                 success=True,
-                audio_path=file_id,  # Return ID instead of full path for security
+                audio_path=file_id,
                 duration=duration,
                 file_size=file_size
             )
@@ -199,6 +221,9 @@ async def extract_audio(youtube_url: YouTubeURL):
     except Exception as e:
         logger.error(f"Unexpected error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+# ... (keep the download-audio and cleanup endpoints the same)
+
 
 @app.get("/download-audio/{file_id}")
 async def download_audio(file_id: str):
